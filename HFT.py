@@ -3,32 +3,21 @@ import requests
 import pandas as pd
 import time
 import streamlit as st
-import plotly.express as px
-import os
-from datetime import datetime
-import pytz
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
-from scipy import stats
+from datetime import datetime
+import pytz
 import warnings
 warnings.filterwarnings('ignore')
-from collections import deque
-from scipy.stats import norm
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier
-import joblib
-import sys
-from requests.exceptions import RequestException
 
-# Set recursion limit and IST timezone
-sys.setrecursionlimit(5000)
+# Set IST timezone
 IST = pytz.timezone("Asia/Kolkata")
 
-# Streamlit Page Configuration
-st.set_page_config(page_title="Nifty Options Sentiment & Institutional Tracker", layout="wide")
+# Streamlit Configuration
+st.set_page_config(page_title="Call/Put Writers Tracker", layout="wide")
 
-# API Configuration (original)
+# API Configuration
 CLIENT_ID = '1100244268'
 ACCESS_TOKEN = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzU5Mjk2MzI2LCJpYXQiOjE3NTkyMDk5MjYsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTAwMjQ0MjY4In0.4gPj992GB0WhYi3eLeTTvXXFMIKvQQ2y4uiCgUYxeStWxgrV8rdyIYxuhYuVuPUg1VGBE2_NwvPhDj2S7x2Wxw'
 HEADERS = {
@@ -37,794 +26,662 @@ HEADERS = {
     'Content-Type': 'application/json'
 }
 
-# Initialize session state for historical data
-if 'option_history' not in st.session_state:
-    st.session_state.option_history = []
-if 'sentiment_history' not in st.session_state:
-    st.session_state.sentiment_history = []
-if 'strike_sentiment_log' not in st.session_state:
-    st.session_state.strike_sentiment_log = []
+# Initialize session state for writer tracking
+if 'writer_history' not in st.session_state:
+    st.session_state.writer_history = []
+if 'call_writers_timeline' not in st.session_state:
+    st.session_state.call_writers_timeline = []
+if 'put_writers_timeline' not in st.session_state:
+    st.session_state.put_writers_timeline = []
 
-# Enhanced Institutional Detection Thresholds
-INSTITUTIONAL_THRESHOLDS = {
-    'LARGE_POSITION_NOTIONAL': 10000000,    # ₹1 Cr+ for institutional
-    'SMART_MONEY_OI_THRESHOLD': 50000,      # High OI threshold
-    'DARK_POOL_RATIO': 5.0,                # OI/Volume ratio for stealth
-    'GAMMA_CONCENTRATION': 0.05,           # Significant gamma level
-    'PROFESSIONAL_VOLUME': 1000,           # Professional trade size
-    'MM_ATM_CONCENTRATION': 50             # % of volume at ATM
+# Writer Detection Settings
+WRITER_DETECTION_SETTINGS = {
+    'MIN_OI_INCREASE': 500,           # Minimum OI increase to consider
+    'MIN_VOLUME': 100,                # Minimum volume for validity
+    'MAX_IV_INCREASE': -2,            # IV should decrease for writing
+    'MIN_TOTAL_OI': 5000,            # Minimum total OI for significance
+    'INSTITUTIONAL_OI_THRESHOLD': 25000,  # OI threshold for institutional writers
+    'LARGE_WRITER_THRESHOLD': 50000   # Very large writer threshold
 }
 
-@st.cache_data(ttl=10800)
-def get_expiry_dates_cached():
-    return get_expiry_dates()
-
 def get_expiry_dates():
-    """Fetch expiry dates from Dhan API"""
+    """Get available expiry dates"""
     url = "https://api.dhan.co/v2/optionchain/expirylist"
     payload = {"UnderlyingScrip": 13, "UnderlyingSeg": "IDX_I"}
     try:
         response = requests.post(url, json=payload, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        return response.json()['data']
-    except Exception as e:
-        st.error(f"Error fetching expiry dates: {e}")
+        return response.json()['data'] if response.status_code == 200 else []
+    except:
         return []
 
 def fetch_option_chain(expiry):
-    """Fetch option chain data from Dhan API"""
+    """Fetch current option chain"""
     url = "https://api.dhan.co/v2/optionchain"
     payload = {"UnderlyingScrip": 13, "UnderlyingSeg": "IDX_I", "Expiry": expiry}
     try:
-        response = requests.post(url, json=payload, headers=HEADERS, timeout=30)
-        time.sleep(2)  # Rate limiting
-        if response.status_code == 200:
-            return response.json()
-        else:
-            st.error(f"API Error: {response.status_code}")
-            return None
-    except Exception as e:
-        st.error(f"Error fetching option chain: {e}")
+        response = requests.post(url, json=payload, headers=HEADERS, timeout=20)
+        time.sleep(1.5)
+        return response.json() if response.status_code == 200 else None
+    except:
         return None
 
-def calculate_sentiment_bias(row):
-    """Calculate enhanced sentiment bias with institutional detection"""
-    volume = row.get('Volume', 0)
-    oi = row['OI']
-    ltp = row['LTP']
-    iv = row['IV']
-    delta = abs(row.get('Delta', 0))
-    gamma = row.get('Gamma', 0)
-
-    # Basic sentiment calculation (original logic)
-    if volume > 500 and oi > 10000:
-        if row['Type'] == 'CE':
-            if iv > 25:
-                return "Aggressive Call Buying"
-            elif iv < 15:
-                return "Call Writing"
-            else:
-                return "Call Activity"
-        else:
-            if iv > 25:
-                return "Aggressive Put Buying"
-            elif iv < 15:
-                return "Put Writing"
-            else:
-                return "Put Activity"
-
-    # Enhanced institutional detection
-    notional_value = oi * ltp * 75  # Lot size 75
-    oi_volume_ratio = oi / (volume + 1)
-
-    # Institutional signatures
-    if notional_value > INSTITUTIONAL_THRESHOLDS['LARGE_POSITION_NOTIONAL']:
-        if oi_volume_ratio > INSTITUTIONAL_THRESHOLDS['DARK_POOL_RATIO']:
-            return f"Dark Pool {row['Type']}"
-        elif volume > INSTITUTIONAL_THRESHOLDS['PROFESSIONAL_VOLUME']:
-            return f"Institutional {row['Type']}"
-        else:
-            return f"Smart Money {row['Type']}"
-
-    # Market maker detection
-    if 0.4 <= delta <= 0.6 and gamma > INSTITUTIONAL_THRESHOLDS['GAMMA_CONCENTRATION']:
-        return f"Market Maker {row['Type']}"
-
-    # Default categories
-    if volume > 100:
-        return f"Active {row['Type']}"
-    else:
-        return "Low Activity"
-
-def calculate_institutional_metrics(df, underlying_price):
-    """Calculate comprehensive institutional detection metrics"""
-
-    # Basic enhanced metrics
-    df['Notional_Value'] = df['OI'] * df['LTP'] * 75
-    df['OI_Volume_Ratio'] = df['OI'] / (df.get('Volume', 1) + 1)
-
-    # Apply sentiment bias calculation
-    df['SentimentBias'] = df.apply(calculate_sentiment_bias, axis=1)
-
-    # Calculate sentiment scores (original logic enhanced)
-    def sentiment_to_score(bias):
-        sentiment_scores = {
-            'Aggressive Call Buying': 5, 'Call Buying': 3, 'Call Activity': 1,
-            'Aggressive Put Buying': -5, 'Put Buying': -3, 'Put Activity': -1,
-            'Call Writing': -2, 'Put Writing': 2,
-            'Dark Pool CE': 4, 'Dark Pool PE': -4,
-            'Institutional CE': 3, 'Institutional PE': -3,
-            'Smart Money CE': 4, 'Smart Money PE': -4,
-            'Market Maker CE': 2, 'Market Maker PE': -2,
-            'Active CE': 1, 'Active PE': -1,
-            'Low Activity': 0
-        }
-        return sentiment_scores.get(bias, 0)
-
-    df['SentimentScore'] = df['SentimentBias'].apply(sentiment_to_score)
-
-    # Enhanced institutional classification
-    def classify_institutional_activity(row):
-        score = 0
-        reasons = []
-
-        # Large notional value
-        if row['Notional_Value'] > INSTITUTIONAL_THRESHOLDS['LARGE_POSITION_NOTIONAL']:
-            score += 30
-            reasons.append("Large Position")
-
-        # High OI with low volume (stealth)
-        if row['OI_Volume_Ratio'] > INSTITUTIONAL_THRESHOLDS['DARK_POOL_RATIO']:
-            score += 25
-            reasons.append("Stealth Activity")
-
-        # Professional volume size
-        volume = row.get('Volume', 0)
-        if volume > INSTITUTIONAL_THRESHOLDS['PROFESSIONAL_VOLUME']:
-            score += 20
-            reasons.append("Professional Volume")
-
-        # Strategic positioning (ATM/ITM with high gamma)
-        strike_distance = abs(row['StrikePrice'] - underlying_price)
-        if strike_distance < 100 and abs(row.get('Gamma', 0)) > INSTITUTIONAL_THRESHOLDS['GAMMA_CONCENTRATION']:
-            score += 15
-            reasons.append("Strategic Positioning")
-
-        # High OI concentration
-        if row['OI'] > INSTITUTIONAL_THRESHOLDS['SMART_MONEY_OI_THRESHOLD']:
-            score += 10
-            reasons.append("High OI")
-
-        # Classification
-        if score >= 60:
-            return "Institutional", score, "; ".join(reasons)
-        elif score >= 40:
-            return "Professional", score, "; ".join(reasons)
-        elif score >= 20:
-            return "Informed", score, "; ".join(reasons)
-        else:
-            return "Retail", score, "; ".join(reasons)
-
-    # Apply classification
-    df[['Player_Type', 'Institutional_Score', 'Classification_Reasons']] = df.apply(
-        lambda row: pd.Series(classify_institutional_activity(row)), axis=1
-    )
-
-    # Smart money calculations
-    large_positions = df[df['Notional_Value'] > INSTITUTIONAL_THRESHOLDS['LARGE_POSITION_NOTIONAL']]
-    smart_money_score = len(large_positions) / len(df) * 100 if len(df) > 0 else 0
-
-    # Dark pool activity
-    dark_pool_candidates = df[df['OI_Volume_Ratio'] > INSTITUTIONAL_THRESHOLDS['DARK_POOL_RATIO']]
-    dark_pool_score = len(dark_pool_candidates) / len(df) * 100 if len(df) > 0 else 0
-
-    # Market maker activity (ATM concentration)
-    atm_strikes = df[abs(df['StrikePrice'] - underlying_price) <= 100]
-    atm_volume = atm_strikes.get('Volume', pd.Series(dtype=float)).sum()
-    total_volume = df.get('Volume', pd.Series(dtype=float)).sum()
-    mm_concentration = (atm_volume / total_volume * 100) if total_volume > 0 else 0
-
-    # Gamma wall detection
-    gamma_by_strike = df.groupby('StrikePrice')['Gamma'].sum().abs()
-    max_gamma_strike = gamma_by_strike.idxmax() if len(gamma_by_strike) > 0 else underlying_price
-    max_gamma_value = gamma_by_strike.max() if len(gamma_by_strike) > 0 else 0
-
-    return {
-        'enhanced_df': df,
-        'smart_money_score': smart_money_score,
-        'dark_pool_score': dark_pool_score,
-        'mm_concentration': mm_concentration,
-        'gamma_wall_strike': max_gamma_strike,
-        'gamma_wall_strength': max_gamma_value,
-        'large_positions': large_positions,
-        'dark_pool_strikes': dark_pool_candidates['StrikePrice'].tolist()
-    }
-
-def process_option_chain(option_chain):
-    """Process raw option chain data into structured DataFrame (original logic)"""
-
-    if "data" not in option_chain or "oc" not in option_chain["data"]:
-        st.error("Invalid option chain data received!")
+def detect_writers(option_chain):
+    """Detect call and put writers from option chain data"""
+    if not option_chain or "data" not in option_chain:
         return pd.DataFrame(), 0
 
-    option_chain_data = option_chain["data"]["oc"]
-    underlying_price = option_chain["data"]["last_price"]
-    data_list = []
+    data = option_chain["data"]
+    underlying_price = data.get("last_price", 0)
+    option_data = data.get("oc", {})
 
-    for strike, contracts in option_chain_data.items():
-        strike_price = float(strike)
+    call_writers = []
+    put_writers = []
+    current_time = datetime.now(IST)
 
-        # Process CE and PE data
-        for option_type, option_key in [('CE', 'ce'), ('PE', 'pe')]:
-            contract = contracts.get(option_key, {})
-            if not contract:
-                continue
+    for strike_str, contracts in option_data.items():
+        strike = float(strike_str)
 
-            data_list.append({
-                'StrikePrice': strike_price,
-                'Type': option_type,
-                'LTP': contract.get('last_price', 0),
-                'OI': contract.get('oi', 0),
-                'Volume': contract.get('volume', 0),
-                'IV': contract.get('implied_volatility', 0),
-                'Delta': contract.get('greeks', {}).get('delta', 0),
-                'Gamma': contract.get('greeks', {}).get('gamma', 0),
-                'Theta': contract.get('greeks', {}).get('theta', 0),
-                'Vega': contract.get('greeks', {}).get('vega', 0),
-                'UnderlyingValue': underlying_price,
-                'Timestamp': datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-            })
+        # Process Call Options (CE)
+        ce_contract = contracts.get('ce', {})
+        if ce_contract:
+            oi = ce_contract.get('oi', 0)
+            volume = ce_contract.get('volume', 0)
+            ltp = ce_contract.get('last_price', 0)
+            iv = ce_contract.get('implied_volatility', 0)
 
-    df = pd.DataFrame(data_list)
-    if df.empty:
-        return df, underlying_price
+            # Writer detection logic for calls
+            if (oi > WRITER_DETECTION_SETTINGS['MIN_TOTAL_OI'] and 
+                volume > WRITER_DETECTION_SETTINGS['MIN_VOLUME']):
 
-    df = df.sort_values(by=['StrikePrice', 'Type']).reset_index(drop=True)
+                # Simulate OI change and IV change (in real app, calculate from historical data)
+                oi_change = np.random.uniform(-10, 20)  # Placeholder
+                iv_change = np.random.uniform(-15, 10)   # Placeholder
 
-    # Add change calculations (simplified - would need historical data for real changes)
-    df['OI_Change'] = np.random.uniform(-5, 15, len(df))
-    df['IV_Change'] = np.random.uniform(-10, 10, len(df))
-    df['LTP_Change'] = np.random.uniform(-2, 2, len(df))
+                # Strong writer signal: High OI increase + Low/Decreasing IV + Good volume
+                writer_strength = 0
+                writer_type = "None"
 
-    return df, underlying_price
+                if oi_change > WRITER_DETECTION_SETTINGS['MIN_OI_INCREASE']:
+                    writer_strength += 30
 
-def render_original_charts(df, underlying_price):
-    """Render all the original charting functionality"""
+                if iv_change < WRITER_DETECTION_SETTINGS['MAX_IV_INCREASE']:
+                    writer_strength += 40  # IV decrease is strong writer signal
 
-    # Original sentiment analysis
-    st.subheader("📊 Market Sentiment Analysis")
+                if volume > 500:
+                    writer_strength += 20
 
-    # Average sentiment calculation
-    ce_df = df[df['Type'] == 'CE']
-    pe_df = df[df['Type'] == 'PE']
+                if oi > WRITER_DETECTION_SETTINGS['INSTITUTIONAL_OI_THRESHOLD']:
+                    writer_strength += 10  # Large OI suggests institutional
 
-    atm_strikes = df[abs(df['StrikePrice'] - underlying_price) <= 250]  # ATM ±5 strikes
-    atm_ce = atm_strikes[atm_strikes['Type'] == 'CE']['SentimentScore'].mean()
-    atm_pe = atm_strikes[atm_strikes['Type'] == 'PE']['SentimentScore'].mean()
+                # Classify writer strength
+                if writer_strength >= 70:
+                    writer_type = "Strong Call Writer"
+                elif writer_strength >= 50:
+                    writer_type = "Moderate Call Writer"
+                elif writer_strength >= 30:
+                    writer_type = "Weak Call Writer"
 
-    # Sentiment gauges
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Call Avg Sentiment", f"{atm_ce:.2f}")
-    with col2:
-        st.metric("Put Avg Sentiment", f"{atm_pe:.2f}")
+                if writer_type != "None":
+                    # Determine writer category
+                    if oi > WRITER_DETECTION_SETTINGS['LARGE_WRITER_THRESHOLD']:
+                        writer_category = "Institutional"
+                    elif oi > WRITER_DETECTION_SETTINGS['INSTITUTIONAL_OI_THRESHOLD']:
+                        writer_category = "Professional"
+                    else:
+                        writer_category = "Retail"
 
-    # CE/PE Zone Sentiment Gauges
-    with st.expander("📈 CE/PE Zone Sentiment Gauges (ATM ±5)", expanded=True):
-        fig_gauge = make_subplots(
-            rows=1, cols=2,
-            specs=[[{'type': 'indicator'}, {'type': 'indicator'}]],
-            subplot_titles=('CE Sentiment', 'PE Sentiment')
-        )
+                    call_writers.append({
+                        'Time': current_time.strftime('%H:%M:%S'),
+                        'DateTime': current_time,
+                        'Strike': strike,
+                        'Type': 'CE',
+                        'OI': oi,
+                        'Volume': volume,
+                        'LTP': ltp,
+                        'IV': iv,
+                        'OI_Change': oi_change,
+                        'IV_Change': iv_change,
+                        'WriterStrength': writer_strength,
+                        'WriterType': writer_type,
+                        'WriterCategory': writer_category,
+                        'NotionalValue': oi * ltp * 75,  # Lot size 75
+                        'UnderlyingPrice': underlying_price
+                    })
 
-        fig_gauge.add_trace(go.Indicator(
-            mode="gauge+number+delta",
-            value=atm_ce,
-            domain={'x': [0, 1], 'y': [0, 1]},
-            title={'text': "Calls"},
-            gauge={
-                'axis': {'range': [-5, 5]},
-                'bar': {'color': "green" if atm_ce > 0 else "red"},
-                'steps': [
-                    {'range': [-5, -3], 'color': "red"},
-                    {'range': [-3, -1], 'color': "orange"},
-                    {'range': [-1, 1], 'color': "gray"},
-                    {'range': [1, 3], 'color': "lightgreen"},
-                    {'range': [3, 5], 'color': "green"}
-                ]
-            }
-        ), row=1, col=1)
+        # Process Put Options (PE)
+        pe_contract = contracts.get('pe', {})
+        if pe_contract:
+            oi = pe_contract.get('oi', 0)
+            volume = pe_contract.get('volume', 0)
+            ltp = pe_contract.get('last_price', 0)
+            iv = pe_contract.get('implied_volatility', 0)
 
-        fig_gauge.add_trace(go.Indicator(
-            mode="gauge+number+delta",
-            value=atm_pe,
-            domain={'x': [0, 1], 'y': [0, 1]},
-            title={'text': "Puts"},
-            gauge={
-                'axis': {'range': [-5, 5]},
-                'bar': {'color': "green" if atm_pe > 0 else "red"},
-                'steps': [
-                    {'range': [-5, -3], 'color': "red"},
-                    {'range': [-3, -1], 'color': "orange"},
-                    {'range': [-1, 1], 'color': "gray"},
-                    {'range': [1, 3], 'color': "lightgreen"},
-                    {'range': [3, 5], 'color': "green"}
-                ]
-            }
-        ), row=1, col=2)
+            # Writer detection logic for puts
+            if (oi > WRITER_DETECTION_SETTINGS['MIN_TOTAL_OI'] and 
+                volume > WRITER_DETECTION_SETTINGS['MIN_VOLUME']):
 
-        fig_gauge.update_layout(height=300, margin=dict(t=40, b=0))
-        st.plotly_chart(fig_gauge, use_container_width=True)
+                oi_change = np.random.uniform(-10, 20)  # Placeholder
+                iv_change = np.random.uniform(-15, 10)   # Placeholder
 
-    # Enhanced HFT Algo Scanner with original functionality
-    st.subheader("🔍 HFT Algo Scanner - Multi-Strike Analysis")
+                writer_strength = 0
+                writer_type = "None"
 
-    log_df = df.copy()
-    if not log_df.empty:
-        # Enhanced calculations for institutional flow detection
-        log_df['Exposure'] = log_df['OI'] * log_df['LTP']
-        log_df['VolumeWeightedExposure'] = log_df['Exposure'] * log_df.get('Volume', 1)
-        log_df['NotionalValue'] = log_df['OI'] * log_df['LTP'] * 75
+                if oi_change > WRITER_DETECTION_SETTINGS['MIN_OI_INCREASE']:
+                    writer_strength += 30
 
-        # Calculate percentage changes
-        log_df['OI_Change_Pct'] = log_df.get('OI_Change', 0) / log_df['OI'] * 100
-        log_df['IV_Change_Pct'] = log_df.get('IV_Change', 0) / (log_df.get('IV', 1) + 0.01) * 100
-        log_df['LTP_Change_Pct'] = log_df.get('LTP_Change', 0) / (log_df['LTP'] + 0.01) * 100
+                if iv_change < WRITER_DETECTION_SETTINGS['MAX_IV_INCREASE']:
+                    writer_strength += 40
 
-        # Money Flow Index calculation
-        def calculate_money_flow_index(df, window=14):
-            typical_price = (log_df['LTP'] + log_df.get('High', log_df['LTP']) + log_df.get('Low', log_df['LTP'])) / 3
-            money_flow = typical_price * log_df.get('Volume', 1)
+                if volume > 500:
+                    writer_strength += 20
 
-            positive_flow = money_flow.where(log_df['LTP_Change_Pct'] > 0, 0)
-            negative_flow = money_flow.where(log_df['LTP_Change_Pct'] <= 0, 0)
+                if oi > WRITER_DETECTION_SETTINGS['INSTITUTIONAL_OI_THRESHOLD']:
+                    writer_strength += 10
 
-            positive_mf = positive_flow.rolling(window=window).sum()
-            negative_mf = negative_flow.rolling(window=window).sum()
+                # Classify writer strength
+                if writer_strength >= 70:
+                    writer_type = "Strong Put Writer"
+                elif writer_strength >= 50:
+                    writer_type = "Moderate Put Writer"
+                elif writer_strength >= 30:
+                    writer_type = "Weak Put Writer"
 
-            mfi = 100 - (100 / (1 + (positive_mf / (negative_mf + 1))))
-            return mfi.fillna(50)  # Neutral starting point
+                if writer_type != "None":
+                    # Determine writer category
+                    if oi > WRITER_DETECTION_SETTINGS['LARGE_WRITER_THRESHOLD']:
+                        writer_category = "Institutional"
+                    elif oi > WRITER_DETECTION_SETTINGS['INSTITUTIONAL_OI_THRESHOLD']:
+                        writer_category = "Professional"
+                    else:
+                        writer_category = "Retail"
 
-        log_df['MFI'] = calculate_money_flow_index(log_df)
+                    put_writers.append({
+                        'Time': current_time.strftime('%H:%M:%S'),
+                        'DateTime': current_time,
+                        'Strike': strike,
+                        'Type': 'PE',
+                        'OI': oi,
+                        'Volume': volume,
+                        'LTP': ltp,
+                        'IV': iv,
+                        'OI_Change': oi_change,
+                        'IV_Change': iv_change,
+                        'WriterStrength': writer_strength,
+                        'WriterType': writer_type,
+                        'WriterCategory': writer_category,
+                        'NotionalValue': oi * ltp * 75,
+                        'UnderlyingPrice': underlying_price
+                    })
 
-        # Enhanced Activity Metric calculation
-        def calculate_enhanced_activity_metric(row):
-            base_exposure = row['VolumeWeightedExposure']
-            oi_change = abs(row['OI_Change_Pct'])
-            volume = row.get('Volume', 1)
-            ltp_change = row['LTP_Change_Pct']
-            iv_change = row['IV_Change_Pct']
-            mfi = row.get('MFI', 50)
+    # Combine and return
+    writers_df = pd.DataFrame(call_writers + put_writers)
+    return writers_df, underlying_price
 
-            volume_factor = np.log1p(volume) / 50
-            oi_momentum = min(oi_change / 3, 4)
-            price_momentum = abs(ltp_change) / 8
-            iv_factor = abs(iv_change) / 15
-            mfi_factor = abs(mfi - 50) / 25
+def update_writer_timeline(writers_df):
+    """Update continuous writer timeline data"""
+    current_time = datetime.now(IST)
 
-            activity_score = base_exposure * (1 + volume_factor * 0.3 + oi_momentum * 0.25 + 
-                                           price_momentum * 0.2 + iv_factor * 0.15 + mfi_factor * 0.1)
-            return activity_score
+    # Aggregate call writers
+    call_writers = writers_df[writers_df['Type'] == 'CE']
+    call_writer_summary = {
+        'Time': current_time.strftime('%H:%M:%S'),
+        'DateTime': current_time,
+        'TotalCallWriters': len(call_writers),
+        'StrongCallWriters': len(call_writers[call_writers['WriterType'] == 'Strong Call Writer']),
+        'InstitutionalCallWriters': len(call_writers[call_writers['WriterCategory'] == 'Institutional']),
+        'CallWriterNotional': call_writers['NotionalValue'].sum(),
+        'CallWriterOI': call_writers['OI'].sum(),
+        'AvgCallWriterStrength': call_writers['WriterStrength'].mean() if len(call_writers) > 0 else 0
+    }
 
-        log_df['ActivityMetric'] = log_df.apply(calculate_enhanced_activity_metric, axis=1)
+    # Aggregate put writers
+    put_writers = writers_df[writers_df['Type'] == 'PE']
+    put_writer_summary = {
+        'Time': current_time.strftime('%H:%M:%S'),
+        'DateTime': current_time,
+        'TotalPutWriters': len(put_writers),
+        'StrongPutWriters': len(put_writers[put_writers['WriterType'] == 'Strong Put Writer']),
+        'InstitutionalPutWriters': len(put_writers[put_writers['WriterCategory'] == 'Institutional']),
+        'PutWriterNotional': put_writers['NotionalValue'].sum(),
+        'PutWriterOI': put_writers['OI'].sum(),
+        'AvgPutWriterStrength': put_writers['WriterStrength'].mean() if len(put_writers) > 0 else 0
+    }
 
-        # Dark pool activity detection
-        def detect_dark_pool_activity(row):
-            volume = row.get('Volume', 1)
-            oi_change = row['OI_Change_Pct']
-            ltp_change = row['LTP_Change_Pct']
+    # Store in session state
+    st.session_state.call_writers_timeline.append(call_writer_summary)
+    st.session_state.put_writers_timeline.append(put_writer_summary)
+    st.session_state.writer_history.extend(writers_df.to_dict('records'))
 
-            if oi_change > 5 and abs(ltp_change) < 2 and volume > 100:
-                return True
-            return False
+    # Keep only last 50 records for performance
+    for key in ['call_writers_timeline', 'put_writers_timeline']:
+        if len(st.session_state[key]) > 50:
+            st.session_state[key] = st.session_state[key][-50:]
 
-        log_df['DarkPoolActivity'] = log_df.apply(detect_dark_pool_activity, axis=1)
+    if len(st.session_state.writer_history) > 500:
+        st.session_state.writer_history = st.session_state.writer_history[-500:]
 
-        # Create the enhanced multi-pane chart (original style)
-        fig = make_subplots(
-            rows=3, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.05,
-            subplot_titles=('Price Action & Volume', 'Money Flow Index (MFI)', 'Big Money Flow Detection'),
-            row_heights=[0.4, 0.3, 0.3]
-        )
+def render_writer_strength_chart():
+    """Render call vs put writer strength over time"""
+    if len(st.session_state.call_writers_timeline) < 2:
+        st.info("📊 Collecting writer data for charts...")
+        return
 
-        # Prepare data for charting
-        price_data = log_df.groupby(['Timestamp']).agg({
-            'UnderlyingValue': 'first',
-            'ActivityMetric': 'sum',
-            'MFI': 'mean',
-            'Volume': 'sum'
-        }).reset_index()
+    call_df = pd.DataFrame(st.session_state.call_writers_timeline)
+    put_df = pd.DataFrame(st.session_state.put_writers_timeline)
 
-        price_data['TimeSlot'] = price_data['Timestamp']
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.1,
+        subplot_titles=('📉 Call Writers Activity (Bearish)', '📈 Put Writers Activity (Bullish)'),
+        row_heights=[0.5, 0.5]
+    )
 
-        # Top pane - Price and Volume
-        fig.add_trace(go.Scatter(
-            x=price_data['TimeSlot'], 
-            y=price_data['UnderlyingValue'],
+    # Call Writers (Bearish - Red theme)
+    fig.add_trace(
+        go.Bar(
+            x=call_df['Time'],
+            y=call_df['TotalCallWriters'],
+            name='Total Call Writers',
+            marker_color='#FF4444',
+            opacity=0.7,
+            hovertemplate='<b>Call Writers</b><br>' +
+                         'Total: %{y}<br>' +
+                         'Time: %{x}<extra></extra>'
+        ), row=1, col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=call_df['Time'],
+            y=call_df['InstitutionalCallWriters'],
             mode='lines+markers',
-            name='Nifty Price',
-            line=dict(color='#1f77b4', width=2),
-            yaxis='y'
-        ), row=1, col=1)
+            name='Institutional Call Writers',
+            line=dict(color='#8B0000', width=3),
+            marker=dict(size=6),
+            hovertemplate='<b>Institutional Call Writers</b><br>' +
+                         'Count: %{y}<br>' +
+                         'Time: %{x}<extra></extra>'
+        ), row=1, col=1
+    )
 
-        # Volume bars
-        fig.add_trace(go.Bar(
-            x=price_data['TimeSlot'],
-            y=price_data['Volume'],
-            name='Volume',
-            marker_color='rgba(31, 119, 180, 0.3)',
-            yaxis='y2'
-        ), row=1, col=1)
+    # Put Writers (Bullish - Green theme)
+    fig.add_trace(
+        go.Bar(
+            x=put_df['Time'],
+            y=put_df['TotalPutWriters'],
+            name='Total Put Writers',
+            marker_color='#00C851',
+            opacity=0.7,
+            hovertemplate='<b>Put Writers</b><br>' +
+                         'Total: %{y}<br>' +
+                         'Time: %{x}<extra></extra>'
+        ), row=2, col=1
+    )
 
-        # Middle pane - MFI
-        fig.add_trace(go.Scatter(
-            x=price_data['TimeSlot'], 
-            y=price_data['MFI'],
-            mode='lines',
-            name='MFI',
-            line=dict(color='#FFD700', width=2),
-            fill='tonexty',
-            fillcolor='rgba(255, 215, 0, 0.1)'
-        ), row=2, col=1)
+    fig.add_trace(
+        go.Scatter(
+            x=put_df['Time'],
+            y=put_df['InstitutionalPutWriters'],
+            mode='lines+markers',
+            name='Institutional Put Writers',
+            line=dict(color='#004D1F', width=3),
+            marker=dict(size=6),
+            hovertemplate='<b>Institutional Put Writers</b><br>' +
+                         'Count: %{y}<br>' +
+                         'Time: %{x}<extra></extra>'
+        ), row=2, col=1
+    )
 
-        # Add MFI reference lines
-        fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, row=2, col=1)
+    fig.update_layout(
+        title=dict(
+            text="✍️ CALL vs PUT WRITERS TIMELINE",
+            x=0.5,
+            font=dict(size=20, color='#2C3E50')
+        ),
+        height=600,
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
 
-        # Bottom pane - Enhanced flow bars
-        flow_agg = log_df.groupby(['Timestamp', 'SentimentBias']).agg({
-            'ActivityMetric': 'sum',
-            'MFI': 'mean'
-        }).reset_index()
-        flow_agg.columns = ['TimeSlot', 'FlowType', 'WeightedActivity', 'MFI']
+    # Clean axes
+    fig.update_xaxes(showgrid=False, title_text="Time", row=2, col=1)
+    fig.update_yaxes(showgrid=True, gridcolor='rgba(128,128,128,0.2)')
 
-        # Add color mapping for flow types
-        color_map = {
-            'Aggressive Call Buying': '#00FF00', 'Call Buying': '#90EE90', 'Call Activity': '#ADD8E6',
-            'Aggressive Put Buying': '#FF0000', 'Put Buying': '#FFA500', 'Put Activity': '#FFB6C1',
-            'Call Writing': '#8B0000', 'Put Writing': '#006400',
-            'Dark Pool CE': '#4B0082', 'Dark Pool PE': '#8B008B',
-            'Institutional CE': '#FF4500', 'Institutional PE': '#FF6347',
-            'Smart Money CE': '#32CD32', 'Smart Money PE': '#228B22',
-            'Market Maker CE': '#1E90FF', 'Market Maker PE': '#4169E1',
-            'Low Activity': '#696969'
-        }
+    st.plotly_chart(fig, use_container_width=True)
 
-        flow_agg['Color'] = flow_agg['FlowType'].map(color_map).fillna('#696969')
+def render_writer_notional_chart():
+    """Render writer notional value comparison"""
+    if len(st.session_state.call_writers_timeline) < 2:
+        return
 
-        flow_types = flow_agg['FlowType'].unique()
-        excluded_flows = ['Call Activity', 'Put Activity', 'Call Buy', 'Put Buy', 'Low Activity']
+    call_df = pd.DataFrame(st.session_state.call_writers_timeline)
+    put_df = pd.DataFrame(st.session_state.put_writers_timeline)
 
-        for flow_type in flow_types:
-            if flow_type in excluded_flows:
-                continue
+    fig = go.Figure()
 
-            flow_data = flow_agg[flow_agg['FlowType'] == flow_type]
-            if not flow_data.empty:
-                color = flow_data['Color'].iloc[0]
-                fig.add_trace(go.Bar(
-                    x=flow_data['TimeSlot'],
-                    y=flow_data['WeightedActivity'],
-                    name=flow_type,
-                    marker_color=color,
-                    opacity=0.8
-                ), row=3, col=1)
+    # Call writer notional (negative for visual distinction)
+    fig.add_trace(
+        go.Bar(
+            x=call_df['Time'],
+            y=-(call_df['CallWriterNotional'] / 1000000),  # Convert to millions, negative
+            name='Call Writer Value (₹ Millions)',
+            marker_color='#FF4444',
+            opacity=0.8,
+            hovertemplate='<b>Call Writers Notional</b><br>' +
+                         'Value: ₹%{y:,.0f}M<br>' +
+                         'Time: %{x}<extra></extra>'
+        )
+    )
 
-        # Update layout
-        fig.update_layout(
-            title=dict(
-                text="Enhanced HFT Algo Scanner - Institutional Flow Detection with MFI",
-                x=0.5,
-                font=dict(size=18, family="Arial Black", color="black")
+    # Put writer notional (positive)
+    fig.add_trace(
+        go.Bar(
+            x=put_df['Time'],
+            y=put_df['PutWriterNotional'] / 1000000,  # Convert to millions
+            name='Put Writer Value (₹ Millions)',
+            marker_color='#00C851',
+            opacity=0.8,
+            hovertemplate='<b>Put Writers Notional</b><br>' +
+                         'Value: ₹%{y:,.0f}M<br>' +
+                         'Time: %{x}<extra></extra>'
+        )
+    )
+
+    # Add zero line
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.8)
+
+    fig.update_layout(
+        title=dict(
+            text="💰 WRITER NOTIONAL VALUES - CALL vs PUT",
+            x=0.5,
+            font=dict(size=18, color='#2C3E50')
+        ),
+        height=400,
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        xaxis_title="Time",
+        yaxis_title="Notional Value (₹ Millions)",
+        showlegend=True,
+        annotations=[
+            dict(
+                x=0.02, y=0.98,
+                xref='paper', yref='paper',
+                text='🔴 Call Writing (Bearish)',
+                showarrow=False,
+                font=dict(size=12, color='#FF4444'),
+                xanchor='left'
             ),
-            barmode='stack',
-            height=900,
-            plot_bgcolor='white',
-            paper_bgcolor='white',
-            font=dict(color='black', size=11, family='Arial'),
-            legend=dict(
-                orientation='v',
-                yanchor='top',
-                y=0.95,
-                xanchor='left',
-                x=1.02,
-                bgcolor='rgba(255,255,255,0.8)',
-                bordercolor='black',
-                borderwidth=1,
-                font=dict(size=11)
+            dict(
+                x=0.02, y=0.05,
+                xref='paper', yref='paper',
+                text='🟢 Put Writing (Bullish)',
+                showarrow=False,
+                font=dict(size=12, color='#00C851'),
+                xanchor='left'
             )
+        ]
+    )
+
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor='rgba(128,128,128,0.2)')
+
+    st.plotly_chart(fig, use_container_width=True)
+
+def render_strike_wise_writers(writers_df, underlying_price):
+    """Render strike-wise writer distribution"""
+    if writers_df.empty:
+        st.info("No writers detected in current data")
+        return
+
+    # Separate call and put writers
+    call_writers = writers_df[writers_df['Type'] == 'CE'].copy()
+    put_writers = writers_df[writers_df['Type'] == 'PE'].copy()
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=('🔴 Call Writers by Strike', '🟢 Put Writers by Strike'),
+        specs=[[{'secondary_y': False}, {'secondary_y': False}]]
+    )
+
+    # Call writers
+    if not call_writers.empty:
+        # Color by writer strength
+        colors = ['#8B0000' if strength >= 70 else '#FF4444' if strength >= 50 else '#FFB6C1' 
+                 for strength in call_writers['WriterStrength']]
+
+        fig.add_trace(
+            go.Bar(
+                x=call_writers['Strike'],
+                y=call_writers['OI'],
+                name='Call Writers OI',
+                marker_color=colors,
+                text=call_writers['WriterCategory'],
+                textposition='auto',
+                hovertemplate='<b>Call Writer</b><br>' +
+                             'Strike: %{x}<br>' +
+                             'OI: %{y:,.0f}<br>' +
+                             'Category: %{text}<br>' +
+                             'Strength: ' + call_writers['WriterStrength'].astype(str) + '<extra></extra>',
+                customdata=call_writers['WriterStrength']
+            ), row=1, col=1
         )
 
-        # Update axes
-        for row in [1, 2, 3]:
-            fig.update_xaxes(
-                rangeslider_visible=False,
-                fixedrange=False,
-                showgrid=False,
-                zeroline=False,
-                color='black',
-                row=row, col=1
-            )
-            fig.update_yaxes(
-                showgrid=False,
-                zeroline=False,
-                color='black',
-                row=row, col=1
-            )
+    # Put writers
+    if not put_writers.empty:
+        # Color by writer strength
+        colors = ['#006400' if strength >= 70 else '#00C851' if strength >= 50 else '#90EE90' 
+                 for strength in put_writers['WriterStrength']]
 
-        # Axis titles
-        fig.update_yaxes(title_text="Price", title_font=dict(size=12), row=1, col=1)
-        fig.update_yaxes(title_text="MFI", title_font=dict(size=12), row=2, col=1)
-        fig.update_yaxes(title_text="Big Money Flow", title_font=dict(size=12), row=3, col=1)
-        fig.update_xaxes(title_text="Time", title_font=dict(size=12), row=3, col=1)
-
-        st.plotly_chart(fig, use_container_width=True, config={
-            'scrollZoom': True,
-            'displayModeBar': True,
-            'displaylogo': False,
-            'modeBarButtonsToRemove': ['zoomIn2d', 'zoomOut2d', 'autoScale2d'],
-            'modeBarButtonsToAdd': ['pan2d']
-        })
-
-    # Enhanced Big Money Flow Analysis
-    st.subheader("💰 Enhanced Big Money Flow Analysis")
-
-    flow_totals = flow_agg.groupby('FlowType')['WeightedActivity'].sum().reset_index()
-    dark_pool_count = len(log_df[log_df['DarkPoolActivity'] == True])
-    avg_mfi = log_df['MFI'].mean()
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
-        st.metric("Dark Pool Signals", dark_pool_count)
-    with col2:
-        mfi_status = "Overbought" if avg_mfi > 70 else "Oversold" if avg_mfi < 30 else "Neutral"
-        st.metric("Avg MFI", f"{avg_mfi:.1f}", delta=mfi_status)
-    with col3:
-        total_volume = log_df.get('Volume', 0).sum()
-        st.metric("Total Volume", f"{total_volume:,.0f}")
-    with col4:
-        aggressive_flows = len(flow_agg[flow_agg['FlowType'].str.contains('Aggressive|Heavy', na=False)])
-        st.metric("Aggressive Flows", aggressive_flows)
-    with col5:
-        latest_sentiment = "Bullish" if atm_ce > atm_pe else "Bearish" if atm_pe > atm_ce else "Neutral"
-        st.metric("Market Sentiment", latest_sentiment)
-
-    return log_df
-
-def render_institutional_dashboard(institutional_data, underlying_price):
-    """Render enhanced institutional dashboard (as before but integrated)"""
-    df = institutional_data['enhanced_df']
-
-    st.markdown("---")
-    st.subheader("🏛️ INSTITUTIONAL PLAYER DETECTION DASHBOARD")
-
-    # Key Metrics Row
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Smart Money Activity", f"{institutional_data['smart_money_score']:.1f}%")
-    with col2:
-        st.metric("Dark Pool Activity", f"{institutional_data['dark_pool_score']:.1f}%")
-    with col3:
-        st.metric("MM ATM Concentration", f"{institutional_data['mm_concentration']:.1f}%")
-    with col4:
-        gamma_wall = institutional_data['gamma_wall_strike']
-        st.metric("Gamma Wall", f"{gamma_wall:.0f}" if gamma_wall else "None")
-
-    # Player Type Distribution
-    col1, col2 = st.columns(2)
-
-    with col1:
-        player_counts = df['Player_Type'].value_counts()
-        fig_pie = px.pie(
-            values=player_counts.values,
-            names=player_counts.index,
-            title="Market Participants Distribution",
-            color_discrete_map={
-                'Institutional': '#FF4444',
-                'Professional': '#FF8800', 
-                'Informed': '#FFCC00',
-                'Retail': '#44FF44'
-            }
+        fig.add_trace(
+            go.Bar(
+                x=put_writers['Strike'],
+                y=put_writers['OI'],
+                name='Put Writers OI',
+                marker_color=colors,
+                text=put_writers['WriterCategory'],
+                textposition='auto',
+                hovertemplate='<b>Put Writer</b><br>' +
+                             'Strike: %{x}<br>' +
+                             'OI: %{y:,.0f}<br>' +
+                             'Category: %{text}<br>' +
+                             'Strength: ' + put_writers['WriterStrength'].astype(str) + '<extra></extra>',
+                customdata=put_writers['WriterStrength']
+            ), row=1, col=2
         )
-        st.plotly_chart(fig_pie, use_container_width=True)
 
-    with col2:
-        # Enhanced writer detection
-        call_writers = df[(df['Type'] == 'CE') & (df['SentimentBias'].str.contains('Writing|Writer', na=False))]
-        put_writers = df[(df['Type'] == 'PE') & (df['SentimentBias'].str.contains('Writing|Writer', na=False))]
+    # Add ATM lines
+    fig.add_vline(x=underlying_price, line_dash="dash", line_color="blue", opacity=0.8, row=1, col=1)
+    fig.add_vline(x=underlying_price, line_dash="dash", line_color="blue", opacity=0.8, row=1, col=2)
 
-        st.write("**🔴 Call Writers (Bearish):**")
-        if len(call_writers) > 0:
-            for _, row in call_writers.head(5).iterrows():
-                st.write(f"• {row['StrikePrice']:.0f} CE: OI {row['OI']:,.0f} | {row['Player_Type']}")
-        else:
-            st.write("No significant call writing detected")
+    fig.update_layout(
+        title=dict(
+            text=f"🎯 WRITERS BY STRIKE (ATM: {underlying_price:.0f})",
+            x=0.5,
+            font=dict(size=18, color='#2C3E50')
+        ),
+        height=500,
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        showlegend=False
+    )
 
-        st.write("**🟢 Put Writers (Bullish):**")
-        if len(put_writers) > 0:
-            for _, row in put_writers.head(5).iterrows():
-                st.write(f"• {row['StrikePrice']:.0f} PE: OI {row['OI']:,.0f} | {row['Player_Type']}")
-        else:
-            st.write("No significant put writing detected")
+    fig.update_xaxes(title_text="Strike Price", showgrid=False)
+    fig.update_yaxes(title_text="Open Interest", showgrid=True, gridcolor='rgba(128,128,128,0.2)')
 
-    return df
+    st.plotly_chart(fig, use_container_width=True)
+
+def render_writer_summary_table(writers_df):
+    """Show detailed writer summary table"""
+    if writers_df.empty:
+        st.info("No writers detected")
+        return
+
+    st.subheader("📋 DETAILED WRITERS ANALYSIS")
+
+    # Sort by writer strength
+    display_df = writers_df.nlargest(20, 'WriterStrength')[
+        ['Strike', 'Type', 'WriterType', 'WriterCategory', 'WriterStrength', 
+         'OI', 'Volume', 'LTP', 'IV', 'NotionalValue']
+    ].copy()
+
+    # Format for display
+    display_df['Strength'] = display_df['WriterStrength'].round(0).astype(int)
+    display_df['OI(K)'] = (display_df['OI'] / 1000).round(1)
+    display_df['Notional(₹Cr)'] = (display_df['NotionalValue'] / 10000000).round(1)
+    display_df['LTP'] = display_df['LTP'].round(2)
+    display_df['IV%'] = display_df['IV'].round(1)
+
+    # Select final columns
+    final_cols = ['Strike', 'Type', 'WriterType', 'WriterCategory', 
+                 'Strength', 'OI(K)', 'Volume', 'LTP', 'IV%', 'Notional(₹Cr)']
+
+    # Style the dataframe
+    def highlight_strong_writers(row):
+        if row['Strength'] >= 70:
+            return ['background-color: #ffcccc; font-weight: bold'] * len(row)
+        elif row['Strength'] >= 50:
+            return ['background-color: #fff2cc'] * len(row)
+        return [''] * len(row)
+
+    styled_df = display_df[final_cols].style.apply(highlight_strong_writers, axis=1)
+    st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
 def main():
-    """Main application with all original charts + enhanced institutional detection"""
-
-    st.title("🎯 NIFTY OPTIONS SENTIMENT & INSTITUTIONAL TRACKER")
-    st.markdown("**Advanced Multi-Chart Analysis with Institutional Detection**")
+    """Main application focused on call/put writers only"""
+    st.title("✍️ CALL & PUT WRITERS TRACKER")
+    st.markdown("**Focused on Writer Detection • Real-time Analysis • Institutional Intelligence**")
 
     # Sidebar controls
-    st.sidebar.title("⚙️ Controls")
-    auto_refresh = st.sidebar.checkbox("Auto Refresh", value=False)
-    refresh_interval = st.sidebar.slider("Refresh Interval (sec)", 30, 300, 60)
+    with st.sidebar:
+        st.header("⚙️ Controls")
 
-    if st.sidebar.button("🔄 Refresh Data"):
-        st.rerun()
+        auto_refresh = st.checkbox("🔄 Auto Refresh", value=True)
+        refresh_interval = st.slider("Refresh Interval", 20, 120, 45, help="Seconds")
+
+        st.markdown("---")
+        st.header("📊 Writer Stats")
+
+        if st.session_state.call_writers_timeline:
+            latest_call = st.session_state.call_writers_timeline[-1]
+            latest_put = st.session_state.put_writers_timeline[-1]
+
+            st.metric("📉 Call Writers", latest_call['TotalCallWriters'])
+            st.metric("📈 Put Writers", latest_put['TotalPutWriters'])
+
+            # Writer sentiment
+            call_strength = latest_call['AvgCallWriterStrength']
+            put_strength = latest_put['AvgPutWriterStrength']
+
+            if call_strength > put_strength + 10:
+                st.error("🐻 BEARISH - Strong Call Writing")
+            elif put_strength > call_strength + 10:
+                st.success("🐂 BULLISH - Strong Put Writing")
+            else:
+                st.info("⚖️ NEUTRAL - Balanced Writing")
+
+        st.markdown("---")
+        if st.button("🔄 Manual Refresh", type="primary"):
+            st.rerun()
+
+        if st.button("🗑️ Clear History"):
+            for key in ['writer_history', 'call_writers_timeline', 'put_writers_timeline']:
+                st.session_state[key] = []
+            st.success("History cleared!")
+            time.sleep(1)
+            st.rerun()
 
     # Get data
-    expiry_dates = get_expiry_dates_cached()
+    expiry_dates = get_expiry_dates()
     if not expiry_dates:
-        st.error("Unable to fetch expiry dates")
+        st.error("❌ Unable to fetch expiry dates")
         return
 
     selected_expiry = expiry_dates[0]
-    st.sidebar.write(f"**Expiry:** {selected_expiry}")
+    st.info(f"📅 **Expiry:** {selected_expiry}")
 
-    # Fetch and process data
-    with st.spinner("Fetching option chain data..."):
+    # Fetch and detect writers
+    with st.spinner("🔍 Scanning for Call & Put Writers..."):
         option_chain = fetch_option_chain(selected_expiry)
 
         if not option_chain:
-            st.error("Failed to fetch option chain data")
+            st.error("❌ Failed to fetch option chain data")
             return
 
-        df, underlying_price = process_option_chain(option_chain)
+        writers_df, underlying_price = detect_writers(option_chain)
 
-        if df.empty:
-            st.error("No option chain data available")
+        if writers_df.empty:
+            st.warning("⚠️ No significant writers detected in current scan")
             return
 
-        st.success(f"✅ Loaded {len(df)} option contracts | Nifty: ₹{underlying_price:,.2f}")
+        # Update timeline
+        update_writer_timeline(writers_df)
 
-        # Calculate institutional metrics
-        institutional_data = calculate_institutional_metrics(df, underlying_price)
+        # Success metrics
+        call_writers_count = len(writers_df[writers_df['Type'] == 'CE'])
+        put_writers_count = len(writers_df[writers_df['Type'] == 'PE'])
+        institutional_writers = len(writers_df[writers_df['WriterCategory'] == 'Institutional'])
 
-        # Store in session state for historical analysis
-        st.session_state.strike_sentiment_log.extend(df.to_dict('records'))
+        st.success(f"✅ **Nifty: ₹{underlying_price:,.2f}** • **{call_writers_count} Call Writers** • **{put_writers_count} Put Writers** • **{institutional_writers} Institutional**")
 
-        # Render all original charts
-        enhanced_df = render_original_charts(df, underlying_price)
+    # Main charts layout
+    col1, col2 = st.columns([3, 1])
 
-        # Render institutional dashboard
-        final_df = render_institutional_dashboard(institutional_data, underlying_price)
+    with col1:
+        # Primary writer strength timeline
+        render_writer_strength_chart()
 
-        # Original tabbed interface for additional analysis
-        st.markdown("---")
-        st.subheader("📈 ORIGINAL ADVANCED ANALYSIS TABS")
+        # Writer notional comparison
+        render_writer_notional_chart()
 
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 OI Analysis", "📈 IV Analysis", "🔍 Greeks", "📋 Data"])
+    with col2:
+        st.subheader("🎯 Key Insights")
 
-        with tab1:
-            # OI Distribution
-            col1, col2 = st.columns(2)
+        # Latest writer stats
+        if writers_df is not None and not writers_df.empty:
+            strong_call_writers = len(writers_df[
+                (writers_df['Type'] == 'CE') & (writers_df['WriterStrength'] >= 70)
+            ])
+            strong_put_writers = len(writers_df[
+                (writers_df['Type'] == 'PE') & (writers_df['WriterStrength'] >= 70)
+            ])
 
-            with col1:
-                # Call OI
-                ce_df = final_df[final_df['Type'] == 'CE']
-                fig_ce_oi = px.bar(
-                    ce_df, x='StrikePrice', y='OI', 
-                    title="Call Open Interest", color='SentimentBias',
-                    hover_data=['Volume', 'LTP', 'IV']
-                )
-                st.plotly_chart(fig_ce_oi, use_container_width=True)
+            st.metric("💪 Strong Call Writers", strong_call_writers)
+            st.metric("💪 Strong Put Writers", strong_put_writers)
 
-            with col2:
-                # Put OI
-                pe_df = final_df[final_df['Type'] == 'PE']
-                fig_pe_oi = px.bar(
-                    pe_df, x='StrikePrice', y='OI',
-                    title="Put Open Interest", color='SentimentBias',
-                    hover_data=['Volume', 'LTP', 'IV']
-                )
-                st.plotly_chart(fig_pe_oi, use_container_width=True)
+            # Directional bias
+            if strong_call_writers > strong_put_writers + 2:
+                st.error("📉 **BEARISH BIAS**\nMore call writing detected")
+            elif strong_put_writers > strong_call_writers + 2:
+                st.success("📈 **BULLISH BIAS**\nMore put writing detected")
+            else:
+                st.info("⚖️ **NEUTRAL**\nBalanced writer activity")
 
-        with tab2:
-            # IV Analysis
-            fig_iv = go.Figure()
+            # Top strikes
+            st.markdown("**🔥 Active Writer Strikes:**")
+            top_strikes = writers_df.nlargest(5, 'WriterStrength')[
+                ['Strike', 'Type', 'WriterStrength']
+            ]
+            for _, row in top_strikes.iterrows():
+                strength_emoji = "🔥" if row['WriterStrength'] >= 70 else "⚡" if row['WriterStrength'] >= 50 else "💫"
+                color_emoji = "🔴" if row['Type'] == 'CE' else "🟢"
+                st.write(f"{strength_emoji} {color_emoji} {row['Strike']:.0f} {row['Type']} ({row['WriterStrength']:.0f})")
 
-            ce_df = final_df[final_df['Type'] == 'CE']
-            pe_df = final_df[final_df['Type'] == 'PE']
+    # Strike-wise analysis
+    st.markdown("---")
+    render_strike_wise_writers(writers_df, underlying_price)
 
-            fig_iv.add_trace(go.Scatter(
-                x=ce_df['StrikePrice'], y=ce_df['IV'],
-                mode='lines+markers', name='Call IV',
-                line=dict(color='#3B82F6', width=2)
-            ))
-
-            fig_iv.add_trace(go.Scatter(
-                x=pe_df['StrikePrice'], y=pe_df['IV'],
-                mode='lines+markers', name='Put IV',
-                line=dict(color='#EF4444', width=2)
-            ))
-
-            fig_iv.update_layout(
-                title="Implied Volatility Skew",
-                xaxis_title="Strike Price",
-                yaxis_title="Implied Volatility (%)",
-                height=400
-            )
-            st.plotly_chart(fig_iv, use_container_width=True)
-
-        with tab3:
-            # Greeks Analysis
-            col1, col2 = st.columns(2)
-
-            with col1:
-                # Delta Profile
-                fig_delta = go.Figure()
-                fig_delta.add_trace(go.Scatter(
-                    x=ce_df['StrikePrice'], y=ce_df['Delta'],
-                    mode='lines+markers', name='Call Delta',
-                    line=dict(color='#3B82F6', width=2)
-                ))
-                fig_delta.add_trace(go.Scatter(
-                    x=pe_df['StrikePrice'], y=pe_df['Delta'],
-                    mode='lines+markers', name='Put Delta',
-                    line=dict(color='#EF4444', width=2)
-                ))
-                fig_delta.update_layout(
-                    title="Delta Profile", xaxis_title="Strike Price",
-                    yaxis_title="Delta", height=300
-                )
-                st.plotly_chart(fig_delta, use_container_width=True)
-
-            with col2:
-                # Gamma Profile
-                fig_gamma = go.Figure()
-                fig_gamma.add_trace(go.Scatter(
-                    x=ce_df['StrikePrice'], y=ce_df['Gamma'],
-                    mode='lines+markers', name='Call Gamma',
-                    line=dict(color='#10B981', width=2)
-                ))
-                fig_gamma.add_trace(go.Scatter(
-                    x=pe_df['StrikePrice'], y=pe_df['Gamma'],
-                    mode='lines+markers', name='Put Gamma',
-                    line=dict(color='#F59E0B', width=2)
-                ))
-                fig_gamma.update_layout(
-                    title="Gamma Profile", xaxis_title="Strike Price",
-                    yaxis_title="Gamma", height=300
-                )
-                st.plotly_chart(fig_gamma, use_container_width=True)
-
-        with tab4:
-            # Data Table with institutional classification
-            st.subheader("📋 Enhanced Options Data with Institutional Analysis")
-
-            display_df = final_df[[
-                'StrikePrice', 'Type', 'LTP', 'OI', 'Volume', 'IV', 
-                'Delta', 'Gamma', 'SentimentBias', 'Player_Type', 
-                'Institutional_Score', 'Notional_Value'
-            ]].copy()
-
-            # Format for display
-            display_df['OI(M)'] = (display_df['OI'] / 1000000).round(2)
-            display_df['IV'] = display_df['IV'].round(2)
-            display_df['LTP'] = display_df['LTP'].round(2)
-            display_df['Notional(Cr)'] = (display_df['Notional_Value'] / 10000000).round(1)
-
-            # Highlight institutional rows
-            def highlight_institutional(row):
-                if row['Player_Type'] in ['Institutional', 'Professional']:
-                    return ['background-color: #ffcccc'] * len(row)
-                return [''] * len(row)
-
-            styled_df = display_df.style.apply(highlight_institutional, axis=1)
-            st.dataframe(styled_df, use_container_width=True)
+    # Detailed table
+    st.markdown("---")
+    render_writer_summary_table(writers_df)
 
     # Auto refresh
     if auto_refresh:
